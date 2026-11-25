@@ -3521,6 +3521,31 @@ impl Drop for SlotGuard {
 
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
 
+thread_local! {
+    // `xcl pipelines`' workers: a big compile that finds every `BIG_COMPILES` slot taken does
+    // not wait for one; `warm` returns `BIG_BUSY` and the worker takes another pipeline.
+    pub(crate) static DEFER_BIG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// `warm`'s answer for a big compile set aside (`DEFER_BIG`)
+pub(crate) const BIG_BUSY: &str = "every big compile slot is taken: set aside";
+
+/// A slot of `slots` if one is free now, then the commit headroom (`big_compile_turn` without
+/// the wait for a slot).
+fn try_big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool) -> Option<SlotGuard> {
+    let slot = {
+        let mut n = slots.n.lock().unwrap();
+        if *n >= slots.most {
+            return None;
+        }
+        *n += 1;
+        SlotGuard(slots)
+    };
+    while !commit_free() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Some(slot)
+}
+
 /// Before a big driver compile in the background: its turn – one at a time, and 3 GB of commit
 /// free (each takes ~1.5 GB; the title loading next to it must not run out). Unless one of the
 /// title's threads waits for the pipeline (`wanted`): then at once and without a slot (None), as
@@ -4404,7 +4429,13 @@ unsafe fn warm_once<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay, drive
             }
             // a big one as the title's background makes it: one at a time, within the commit left
             // (no title thread waits for the tool's pipelines)
-            let _big = (compiled.dxil.len() >= BIG_DRIVER_COMPILE).then(|| big_compile_turn(&BIG_COMPILES, big_compile_commit_free, || false));
+            let _big = if compiled.dxil.len() < BIG_DRIVER_COMPILE {
+                None
+            } else if DEFER_BIG.with(|d| d.get()) {
+                Some(try_big_compile_turn(&BIG_COMPILES, big_compile_commit_free).ok_or(BIG_BUSY)?)
+            } else {
+                big_compile_turn(&BIG_COMPILES, big_compile_commit_free, || false)
+            };
             let _slot = driver();
             let started = std::time::Instant::now();
             let made = dev.CreateComputePipelineState::<ID3D12PipelineState>(&copy);

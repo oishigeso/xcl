@@ -93,6 +93,9 @@ struct Queue {
     /// pipelines the title built, then the others (journal order)
     used: VecDeque<u64>,
     rest: VecDeque<u64>,
+    /// big ones a worker set aside while every big compile slot was taken (`real::DEFER_BIG`):
+    /// taken again once `used` and `rest` are empty, and then they wait for a slot
+    deferred: VecDeque<u64>,
     /// done, or taken by a worker
     taken: HashSet<u64>,
     shaders: HashMap<u64, Arc<Vec<u8>>>,
@@ -167,20 +170,26 @@ impl Queue {
         new
     }
 
-    fn next(&mut self) -> Option<(u64, Option<Replay>)> {
+    /// The next pipeline, and whether it is one set aside before (`deferred`).
+    fn next(&mut self) -> Option<(u64, Option<Replay>, bool)> {
         while let Some(h) = self.used.pop_front().or_else(|| self.rest.pop_front()) {
             if !self.taken.insert(h) {
                 continue;
             }
-            let (tag, payload) = self.pipes.get(&h)?.clone();
-            let frame = pso_journal::Frame { tag, windows: self.windows, hash: h, payload: &payload };
-            return Some((h, pso_journal::replay(&frame, |s| self.shaders.get(&s).map(|b| b.to_vec()))));
+            return Some((h, self.replay(h)?, false));
         }
-        None
+        let h = self.deferred.pop_front()?;
+        Some((h, self.replay(h)?, true))
+    }
+
+    fn replay(&self, h: u64) -> Option<Option<Replay>> {
+        let (tag, payload) = self.pipes.get(&h)?.clone();
+        let frame = pso_journal::Frame { tag, windows: self.windows, hash: h, payload: &payload };
+        Some(pso_journal::replay(&frame, |s| self.shaders.get(&s).map(|b| b.to_vec())))
     }
 
     fn left(&self) -> usize {
-        self.used.len() + self.rest.len()
+        self.used.len() + self.rest.len() + self.deferred.len()
     }
 }
 
@@ -324,7 +333,10 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
                             return;
                         }
                         if let Some(it) = g.next() {
-                            started.fetch_add(1, Ordering::Relaxed);
+                            // (one set aside was counted when it was first taken)
+                            if !it.2 {
+                                started.fetch_add(1, Ordering::Relaxed);
+                            }
                             break it;
                         }
                         if !watch || g.closed {
@@ -333,13 +345,24 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
                         g = q.1.wait(g).unwrap();
                     }
                 };
-                let (hash, replay) = item;
+                let (hash, replay, was_deferred) = item;
                 trying.lock().unwrap().set(hash, true);
+                // A big one that finds every big slot taken is set aside while other pipelines
+                // remain, so a worker does not wait behind it with the queue's small ones (with
+                // one slot, 11 of 12 workers sat in that wait); once only set-aside ones are
+                // left, they wait for a slot.
+                crate::hle::d3d12x::real::DEFER_BIG.with(|d| d.set(!was_deferred));
                 let r = match &replay {
                     None => Err("not readable from the journal".to_string()),
                     // the driver's compiles, few at once (the biggest take ~1.5 GB each)
                     Some(r) => unsafe { crate::hle::d3d12x::real::warm(dev, r, || DriverSlot::take(gpu, gpu_most)) },
                 };
+                if matches!(&r, Err(e) if e == crate::hle::d3d12x::real::BIG_BUSY) {
+                    trying.lock().unwrap().set(hash, false);
+                    q.0.lock().unwrap().deferred.push_back(hash);
+                    q.1.notify_one();
+                    continue;
+                }
                 // done: made, or left to the title; a failure is tried again by the next run
                 let done = match r {
                     Ok(()) => {
@@ -542,6 +565,32 @@ mod tests {
         assert_eq!(bytes, [2u64.to_le_bytes(), 5u64.to_le_bytes()].concat(), "the old file was replaced, not appended to");
     }
 
+    /// A big pipeline set aside while every big compile slot is taken comes back only once the
+    /// others are taken, marked as set aside (it then waits for a slot), and is not taken twice.
+    #[test]
+    fn a_set_aside_pipeline_comes_after_the_others_and_once() {
+        let path = std::env::temp_dir().join(format!("xcl_pipelines_deferred_{}.bin", std::process::id()));
+        let mut j = pso_journal::MAGIC.to_vec();
+        for h in [1u64, 2, 3] {
+            j.extend(frame(b'C', h, &[0; 8]));
+        }
+        std::fs::write(&path, &j).unwrap();
+        let mut f = std::fs::File::open(&path).unwrap();
+        let mut q = Queue::default();
+        assert_eq!(q.ingest(&mut f), 3);
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+        let (first, _, deferred) = q.next().unwrap();
+        assert!(!deferred);
+        q.deferred.push_back(first); // its big compile found no free slot
+        assert_eq!(q.left(), 3);
+        let rest: Vec<(u64, bool)> = std::iter::from_fn(|| q.next().map(|(h, _, d)| (h, d))).collect();
+        assert_eq!(rest.len(), 3);
+        assert!(rest[..2].iter().all(|&(h, d)| h != first && !d), "the others first: {rest:?}");
+        assert_eq!(rest[2], (first, true), "then the one set aside, marked");
+        assert!(q.next().is_none() && q.left() == 0);
+    }
+
     fn frame(tag: u8, hash: u64, payload: &[u8]) -> Vec<u8> {
         let mut v = vec![tag, 4, 0, 0];
         v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -567,13 +616,13 @@ mod tests {
         q.taken.insert(1);
         assert_eq!(q.ingest(&mut f), 2, "pipeline 1 was done before");
         assert_eq!(q.windows, 4);
-        assert_eq!(q.next().map(|(h, _)| h), Some(3), "the used one first");
+        assert_eq!(q.next().map(|(h, _, _)| h), Some(3), "the used one first");
         // the rest of the torn frame arrives: 2 is used now
         let mut w = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         w.write_all(&tail[5..]).unwrap();
         drop(w);
         assert_eq!(q.ingest(&mut f), 0);
-        assert_eq!(q.next().map(|(h, _)| h), Some(2));
+        assert_eq!(q.next().map(|(h, _, _)| h), Some(2));
         assert!(q.next().is_none(), "each pipeline once");
         drop(f);
         let _ = std::fs::remove_file(&path);
